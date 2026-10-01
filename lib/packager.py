@@ -1,16 +1,21 @@
 #!/usr/bin/python3
 #
-# Requirements:
-# - zipfile2
-# - pyminizip
-# - py7zr
-# - pycdlib
-# - cabarchive
-# - pypdf2
+# Requirements (see requirements.txt):
+# - colorama             (always)
+# - pypdf                (PDF output; PyPDF2 3.x also accepted)
+# - py7zr                (7z output)
+# - pycdlib              (ISO/IMG output)
+# - cabarchive           (CAB output)
+# - pyminizip            (password protected ZIP only)
+#
+# Every backend except colorama is imported lazily via lib.deps, so a missing
+# or unbuildable optional package disables just that one output format instead
+# of preventing the tool from starting.
 #
 
 import os, sys, re
 import glob
+import fnmatch
 import string
 import random
 import base64
@@ -18,20 +23,15 @@ import shutil
 import zipfile
 import time
 import tempfile
-import pyminizip
-import py7zr
-import pycdlib
-import cabarchive
 import traceback
 import csv
 import subprocess
-import ctypes
-#import libarchive
 
 from io import StringIO
 
-from PyPDF2 import PdfReader, PdfWriter
-from PyPDF2.generic import DecodedStreamObject, NameObject, DictionaryObject, createStringObject, ArrayObject
+import lib.deps
+import lib.pdfcompat as pdfcompat
+from lib.deps import MissingDependency
 
 try:
     from cStringIO import StringIO as BytesIO
@@ -179,15 +179,37 @@ class Packager:
 
     @staticmethod
     def checkFilenameAgainstWildcard(filename, wildcard):
-        rex = wildcard.replace('*', '.*').replace('?', '.')
-        return re.match(rex, filename, re.I) is not None
+        #
+        # Translate the shell-style wildcard with fnmatch so that regex
+        # metacharacters in the filename are escaped and the match is anchored
+        # at both ends. Hand-rolling "*"->".*" previously let --hide evil.exe
+        # also match evilXexeBAK, while a literal "f(1).doc" matched nothing.
+        #
+        # Backslashes are normalised to forward slashes because archive member
+        # names use "/" while operators tend to type Windows-style paths.
+        #
+        filename = filename.replace('\\', '/')
+        wildcard = wildcard.replace('\\', '/')
+
+        return fnmatch.fnmatch(filename.lower(), wildcard.lower())
 
     @staticmethod
     def shell(cmd, cwd = ''):
-        CREATE_NO_WINDOW = 0x08000000
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
+        #
+        # subprocess.STARTUPINFO and CREATE_NO_WINDOW exist only on Windows;
+        # referencing them unconditionally made this helper raise AttributeError
+        # on every other platform.
+        #
+        kwargs = {}
+
+        if os.name == 'nt':
+            CREATE_NO_WINDOW = 0x08000000
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+
+            kwargs['startupinfo'] = si
+            kwargs['creationflags'] = CREATE_NO_WINDOW
 
         if cwd == '':
             cwd = os.getcwd()
@@ -200,8 +222,7 @@ class Packager:
             shell=True, 
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            startupinfo=si, 
-            creationflags=CREATE_NO_WINDOW
+            **kwargs
         )
         try:
             outs, errs = proc.communicate(timeout=60)
@@ -438,6 +459,7 @@ class Packager:
                         fname1 = fname.replace(tmpdir, '')
                         self.logger.dbg(f'{fname1} => {outn}{basename}')
 
+                    pyminizip = lib.deps.require('zip-password')
                     pyminizip.compress_multiple(infiles, outfiles, outfile, self.password, 5)
 
                 if os.path.isdir(tmpdir):
@@ -468,6 +490,8 @@ class Packager:
             pwd = None
             if self.password:
                 pwd = self.password
+
+            py7zr = lib.deps.require('7zip')
 
             with py7zr.SevenZipFile(outfile, mode=mode, password=pwd) as container:
                 with open(infile, 'rb') as f:
@@ -531,6 +555,8 @@ class Packager:
 
         if self.password:
             self.logger.fatal('VHD files do not support password encryption.')
+
+        import ctypes
 
         if not ctypes.windll.shell32.IsUserAnAdmin():
             self.logger.fatal('You need to run this program as Local Administrator. This is required to make DISKPART create & mount VHD!')
@@ -834,7 +860,7 @@ DISKPART> detach vdisk
     def collectIsoJolietFiles(self, iso, basedir = '/'):
         files = []
         for dirname, dirlist, filelist in iso.walk(joliet_path=basedir):
-            print(f"Base: {basedir}, Dirname:", dirname, ", Dirlist:", dirlist, ", Filelist:", filelist)
+            self.logger.dbg(f'Base: {basedir}, Dirname: {dirname}, Dirlist: {dirlist}, Filelist: {filelist}')
 
             for file in filelist:
                 if ';' in file:
@@ -863,7 +889,7 @@ DISKPART> detach vdisk
                 self.logger.fatal('Passwords are not supported by IMG/ISO files.')
 
             if self.backdoorFile:
-                iso = pycdlib.PyCdlib()
+                iso = lib.deps.require('iso').PyCdlib()
                 iso.open(self.backdoorFile)
 
                 self.logger.dbg('ISO Joliet traversal:')
@@ -919,7 +945,7 @@ DISKPART> detach vdisk
                                 self.logger.dbg(f'\t- file: {fname} => {lf}')
                                 localfiles.append(('file', fname, lf))
 
-                    iso2 = pycdlib.PyCdlib()
+                    iso2 = lib.deps.require('iso').PyCdlib()
                     iso2.new(joliet=3)
 
                     self.logger.text('\nBurning files onto ISO:')
@@ -957,7 +983,7 @@ DISKPART> detach vdisk
                 return True
 
             else:
-                iso = pycdlib.PyCdlib()
+                iso = lib.deps.require('iso').PyCdlib()
                 iso.new(joliet=3)
 
                 if os.path.isfile(infile):
@@ -1036,47 +1062,47 @@ DISKPART> detach vdisk
     #
     def pdfAppendAttachment(self, myPdfFileWriterObj, fname, fdata):
         # The entry for the file
-        file_entry = DecodedStreamObject()
-        file_entry.setData(fdata)
+        file_entry = pdfcompat.DecodedStreamObject()
+        pdfcompat.stream_set_data(file_entry, fdata)
         file_entry.update({
-            NameObject("/Type"): NameObject("/EmbeddedFile")
+            pdfcompat.NameObject("/Type"): pdfcompat.NameObject("/EmbeddedFile")
         })
 
         # The Filespec entry
-        efEntry = DictionaryObject()
+        efEntry = pdfcompat.DictionaryObject()
         efEntry.update({ 
-            NameObject("/F"): file_entry 
+            pdfcompat.NameObject("/F"): file_entry 
         })
 
-        filespec = DictionaryObject()
+        filespec = pdfcompat.DictionaryObject()
         filespec.update({
-            NameObject("/Type"): NameObject("/Filespec"),
-            NameObject("/F"): createStringObject(fname),
-            NameObject("/EF"): efEntry
+            pdfcompat.NameObject("/Type"): pdfcompat.NameObject("/Filespec"),
+            pdfcompat.NameObject("/F"): pdfcompat.create_string_object(fname),
+            pdfcompat.NameObject("/EF"): efEntry
         })
 
-        if "/Names" not in myPdfFileWriterObj._root_object.keys():
+        if "/Names" not in pdfcompat.writer_root(myPdfFileWriterObj).keys():
             self.logger.dbg('No files attached yet. Create the entry for the root, as it needs a reference to the Filespec')
             
-            embeddedFilesNamesDictionary = DictionaryObject()
+            embeddedFilesNamesDictionary = pdfcompat.DictionaryObject()
             embeddedFilesNamesDictionary.update({
-                NameObject("/Names"): ArrayObject([createStringObject(fname), filespec])
+                pdfcompat.NameObject("/Names"): pdfcompat.ArrayObject([pdfcompat.create_string_object(fname), filespec])
             })
 
-            embeddedFilesDictionary = DictionaryObject()
+            embeddedFilesDictionary = pdfcompat.DictionaryObject()
             embeddedFilesDictionary.update({
-                NameObject("/EmbeddedFiles"): embeddedFilesNamesDictionary
+                pdfcompat.NameObject("/EmbeddedFiles"): embeddedFilesNamesDictionary
             })
 
-            myPdfFileWriterObj._root_object.update({
-                NameObject("/Names"): embeddedFilesDictionary
+            pdfcompat.writer_root(myPdfFileWriterObj).update({
+                pdfcompat.NameObject("/Names"): embeddedFilesDictionary
             })
 
         else:
             self.logger.dbg('There are files already attached. Append the new file.')
 
-            myPdfFileWriterObj._root_object["/Names"]["/EmbeddedFiles"]["/Names"].append(createStringObject(fname))
-            myPdfFileWriterObj._root_object["/Names"]["/EmbeddedFiles"]["/Names"].append(filespec)
+            pdfcompat.writer_root(myPdfFileWriterObj)["/Names"]["/EmbeddedFiles"]["/Names"].append(pdfcompat.create_string_object(fname))
+            pdfcompat.writer_root(myPdfFileWriterObj)["/Names"]["/EmbeddedFiles"]["/Names"].append(filespec)
 
 
     def packIntoPDF(self, infile, outfile):
@@ -1119,22 +1145,21 @@ Pssst. .doc/.xls work like a charm ;-)
 =====================================================
 ''', color='red')
 
-            fw = PdfWriter()
+            pdfcompat.require()
+
+            fw = pdfcompat.PdfWriter()
 
             if self.backdoorFile:
                 self.logger.text('Copying pages from backdoored PDF to the output one...')
 
-                fr = PdfReader(self.backdoorFile, 'rb')
-                fw.appendPagesFromReader(fr)
-                self.logger.info(f'Copied {fr.numPages} pages from backdoored file to output.')
+                fr = pdfcompat.PdfReader(self.backdoorFile)
+                pdfcompat.writer_append_pages(fw, fr)
+                self.logger.info(f'Copied {pdfcompat.reader_num_pages(fr)} pages from backdoored file to output.')
 
             else:
                 self.logger.text('Creating a new PDF with a single, blank page.')
 
-                fw.addBlankPage(
-                    width = 200,
-                    height = 200
-                )
+                pdfcompat.writer_blank_page(fw, width = 200, height = 200)
 
             files = []
 
@@ -1165,14 +1190,14 @@ Pssst. .doc/.xls work like a charm ;-)
                 autorunJs = f'this.exportDataObject({{ cName: "{fname}", nLaunch: 2 }});'
                 self.logger.dbg('\t' + autorunJs + '\n')
                 
-                fw.addJS(autorunJs)
+                pdfcompat.writer_add_js(fw, autorunJs)
 
                 if len(files) == 1:
                     if self.fileName:
                         fname = self.fileName
 
                     self.logger.text(f'\tAdding file: {fname}')
-                    fw.addAttachment(fname, data)
+                    pdfcompat.writer_add_attachment(fw, fname, data)
 
                 else:
                     self.logger.text(f'\tAdding file: {fname}')
@@ -1214,7 +1239,7 @@ When PDF is password-encrypted, autorun Javascript will not execute to prompt us
 
                 tmpdir = tempfile.TemporaryDirectory()
                 with open(self.backdoorFile, "rb") as f:
-                    arc = cabarchive.CabArchive(f.read())
+                    arc = lib.deps.require('cabinet').CabArchive(f.read())
 
                 self.logger.dbg('Extracting files from CAB:')
                 
@@ -1247,16 +1272,16 @@ When PDF is password-encrypted, autorun Javascript will not execute to prompt us
                 if self.fileName:
                     fname = self.fileName
 
-                arc = cabarchive.CabArchive()
+                arc = lib.deps.require('cabinet').CabArchive()
                 with open(infile, 'rb') as f:
-                    arc[fname] = cabarchive.CabFile(f.read())
+                    arc[fname] = lib.deps.require('cabinet').CabFile(f.read())
 
                 with open(outfile, "wb") as container:
                     self.logger.text(f'\tAdding file: {fname}')
                     container.write(arc.save())
             else:
                 with open(outfile, "wb") as container:
-                    arc = cabarchive.CabArchive()
+                    arc = lib.deps.require('cabinet').CabArchive()
 
                     for file in glob.iglob(infile + '/**/**', recursive=True):
                         lf = file.replace(infile, '')
@@ -1276,7 +1301,7 @@ When PDF is password-encrypted, autorun Javascript will not execute to prompt us
                         self.logger.dbg(f'\t- file: {file} => {lf}')
 
                         with open(file, 'rb') as f:
-                            arc[lf] = cabarchive.CabFile(f.read())
+                            arc[lf] = lib.deps.require('cabinet').CabFile(f.read())
 
                         self.logger.text(f'\tAdding file: {lf}')
                     
