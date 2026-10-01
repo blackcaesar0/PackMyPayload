@@ -14,7 +14,7 @@ except:
     pass
 
 class Logger:
-    options = {
+    _default_options = {
         'debug': False,
         'verbose': False,
         'nocolor' : False,
@@ -47,7 +47,7 @@ class Logger:
     }
 
     def __init__(self, opts = None):
-        self.options.update(Logger.options)
+        self.options = dict(Logger._default_options)
 
         if opts is not None and len(opts) > 0:
             self.options.update(opts)
@@ -58,7 +58,7 @@ class Logger:
 
     @staticmethod
     def colorize(txt, col):
-        if Logger.options['nocolor'] or len(col) == 0:
+        if len(col) == 0:
             return txt
             
         if not col in Logger.colors_map.keys():

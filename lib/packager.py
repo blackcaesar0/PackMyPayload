@@ -18,7 +18,12 @@ import shutil
 import zipfile
 import time
 import tempfile
-import pyminizip
+try:
+    import pyminizip
+    PYMINIZIP_LOADED = True
+except ImportError:
+    PYMINIZIP_LOADED = False
+
 import py7zr
 import pycdlib
 import cabarchive
@@ -184,25 +189,27 @@ class Packager:
 
     @staticmethod
     def shell(cmd, cwd = ''):
-        CREATE_NO_WINDOW = 0x08000000
-        si = subprocess.STARTUPINFO()
-        si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        si.wShowWindow = subprocess.SW_HIDE
-
         if cwd == '':
             cwd = os.getcwd()
 
-        outs = ''
-        errs = ''
-        proc = subprocess.Popen(
-            cmd,
-            cwd = cwd,
-            shell=True, 
+        kwargs = dict(
+            cwd=cwd,
+            shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            startupinfo=si, 
-            creationflags=CREATE_NO_WINDOW
         )
+
+        if os.name == 'nt':
+            CREATE_NO_WINDOW = 0x08000000
+            si = subprocess.STARTUPINFO()
+            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            si.wShowWindow = subprocess.SW_HIDE
+            kwargs['startupinfo'] = si
+            kwargs['creationflags'] = CREATE_NO_WINDOW
+
+        outs = ''
+        errs = ''
+        proc = subprocess.Popen(cmd, **kwargs)
         try:
             outs, errs = proc.communicate(timeout=60)
             proc.wait()
@@ -384,7 +391,7 @@ class Packager:
             zipAttribs = {}
 
             if not self.options.get('zip_noreadonly', False):
-                if os.path.isfile(infile) and self.isFileExtensionSupported(infile):
+                if os.path.isfile(infile) and self.isOfficeDocumentExtension(infile):
                     self.logger.info(f'Applying MOTW bypass on ZIP by setting {os.path.basename(infile)} as Read-Only upon extraction.')
 
                     if not self.zip_motw_bypass_warning_once:
@@ -410,7 +417,7 @@ class Packager:
 
                 with tempfile.TemporaryDirectory() as tmpdir:
                     with zipfile.ZipFile(f.name) as zf:
-                        zf.extractall(path=tmpdir, pwd=self.password.encode())
+                        zf.extractall(path=tmpdir)
 
                     f.close()
                     os.unlink(f.name)
@@ -438,6 +445,8 @@ class Packager:
                         fname1 = fname.replace(tmpdir, '')
                         self.logger.dbg(f'{fname1} => {outn}{basename}')
 
+                    if not PYMINIZIP_LOADED:
+                        raise RuntimeError('pyminizip is not installed; password-protected ZIP requires it.')
                     pyminizip.compress_multiple(infiles, outfiles, outfile, self.password, 5)
 
                 if os.path.isdir(tmpdir):
@@ -456,8 +465,6 @@ class Packager:
         except Exception as e:
             self.logger.err(f'Could not package input file into ZIP! Exception: {e}')
             raise
-
-            return False
 
     def packInto7ZIP(self, infile, outfile, local_path=None):
         try:
@@ -483,8 +490,6 @@ class Packager:
         except Exception as e:
             self.logger.err(f'Could not package input file into 7zip! Exception: {e}')
             raise
-
-            return False
 
     def packIntoMSI(self, infile, outfile):
         raise Exception("MSI files are not yet supported.")
@@ -834,7 +839,7 @@ DISKPART> detach vdisk
     def collectIsoJolietFiles(self, iso, basedir = '/'):
         files = []
         for dirname, dirlist, filelist in iso.walk(joliet_path=basedir):
-            print(f"Base: {basedir}, Dirname:", dirname, ", Dirlist:", dirlist, ", Filelist:", filelist)
+            self.logger.dbg(f"Base: {basedir}, Dirname: {dirname}, Dirlist: {dirlist}, Filelist: {filelist}")
 
             for file in filelist:
                 if ';' in file:
@@ -1028,8 +1033,6 @@ DISKPART> detach vdisk
             self.logger.err(f'Could not package input file into ISO! Exception: {e}')
             raise
 
-            return False
-
     #
     # Source:
     #   https://stackoverflow.com/a/59085770
@@ -1037,7 +1040,7 @@ DISKPART> detach vdisk
     def pdfAppendAttachment(self, myPdfFileWriterObj, fname, fdata):
         # The entry for the file
         file_entry = DecodedStreamObject()
-        file_entry.setData(fdata)
+        file_entry.set_data(fdata)
         file_entry.update({
             NameObject("/Type"): NameObject("/EmbeddedFile")
         })
@@ -1124,14 +1127,15 @@ Pssst. .doc/.xls work like a charm ;-)
             if self.backdoorFile:
                 self.logger.text('Copying pages from backdoored PDF to the output one...')
 
-                fr = PdfReader(self.backdoorFile, 'rb')
-                fw.appendPagesFromReader(fr)
-                self.logger.info(f'Copied {fr.numPages} pages from backdoored file to output.')
+                with open(self.backdoorFile, 'rb') as _pdf_fh:
+                    fr = PdfReader(_pdf_fh)
+                    fw.append_pages_from_reader(fr)
+                    self.logger.info(f'Copied {len(fr.pages)} pages from backdoored file to output.')
 
             else:
                 self.logger.text('Creating a new PDF with a single, blank page.')
 
-                fw.addBlankPage(
+                fw.add_blank_page(
                     width = 200,
                     height = 200
                 )
@@ -1165,14 +1169,14 @@ Pssst. .doc/.xls work like a charm ;-)
                 autorunJs = f'this.exportDataObject({{ cName: "{fname}", nLaunch: 2 }});'
                 self.logger.dbg('\t' + autorunJs + '\n')
                 
-                fw.addJS(autorunJs)
+                fw.add_js(autorunJs)
 
                 if len(files) == 1:
                     if self.fileName:
                         fname = self.fileName
 
                     self.logger.text(f'\tAdding file: {fname}')
-                    fw.addAttachment(fname, data)
+                    fw.add_attachment(fname, data)
 
                 else:
                     self.logger.text(f'\tAdding file: {fname}')
@@ -1199,8 +1203,6 @@ When PDF is password-encrypted, autorun Javascript will not execute to prompt us
         except Exception as e:
             self.logger.err(f'Could not package input file into PDF! Exception: {e}')
             raise
-
-            return False
 
     def packIntoCAB(self, infile, outfile):
         try:
@@ -1287,8 +1289,6 @@ When PDF is password-encrypted, autorun Javascript will not execute to prompt us
         except Exception as e:
             self.logger.err(f'Could not package input file into CAB! Exception: {e}')
             raise
-
-            return False
 
         finally:
             if tmpdir:
